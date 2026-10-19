@@ -1,0 +1,96 @@
+name: E2E Docker Compose Stack
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+    paths:
+      - "frontend/**"
+      - "mergemint-backend/**"
+      - "src/**"
+      - "docker-compose.yml"
+      - ".github/workflows/e2e-docker-compose.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "mergemint-backend/**"
+      - "src/**"
+      - "docker-compose.yml"
+      - ".github/workflows/e2e-docker-compose.yml"
+
+jobs:
+  e2e-docker:
+    name: Playwright E2E against docker-compose stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      # Stellar quickstart for local contract deployment
+      stellar:
+        image: stellar/quickstart:latest
+        env:
+          STELLAR_NETWORK_PASSPHRASE: Test SDF Network ; September 2015
+        ports:
+          - 8000:8000
+          - 11626:11626
+          - 11625:11625
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start docker-compose stack
+        run: |
+          docker-compose up -d
+          echo "Waiting for services to be ready..."
+          sleep 10
+        env:
+          COMPOSE_FILE: docker-compose.yml
+
+      - name: Wait for services
+        run: |
+          timeout 60 bash -c 'until curl -s http://localhost:3000 > /dev/null; do sleep 1; done'
+          timeout 60 bash -c 'until curl -s http://localhost:8080 > /dev/null 2>&1; do sleep 1; done'
+        continue-on-error: true
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Install Playwright
+        working-directory: frontend
+        run: npx playwright install --with-deps
+
+      - name: Run E2E tests
+        working-directory: frontend
+        run: npm run test:e2e
+        env:
+          CI: true
+          PLAYWRIGHT_TIMEOUT: 30000
+
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: frontend/test-results/
+          retention-days: 7
+
+      - name: Upload Playwright screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-screenshots
+          path: frontend/test-results/**/
+          retention-days: 7
+
+      - name: Stop docker-compose stack
+        if: always()
+        run: docker-compose down
+        continue-on-error: true

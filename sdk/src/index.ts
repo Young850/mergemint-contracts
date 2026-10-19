@@ -204,12 +204,20 @@ function sleep(ms: number): Promise<void> {
 
 // === SDK
 
+/** Minimum supported contract version (semantic versioning). */
+const SUPPORTED_CONTRACT_VERSION_MIN = "1.0.0";
+
+/** Maximum supported contract version (semantic versioning). */
+const SUPPORTED_CONTRACT_VERSION_MAX = "1.99.99";
+
 export class MergeMintSDK {
   private readonly rpc: SorobanRpc.Server;
   private readonly contract: Contract;
   private readonly networkPassphrase: string;
   private readonly contractId: string;
   private readonly retry: RetryOptions;
+  private versionCheckPerformed = false;
+  private skipVersionCheck = false;
 
   /**
    * Creates an SDK bound to a single Soroban RPC endpoint and contract.
@@ -218,11 +226,13 @@ export class MergeMintSDK {
    * endpoint, `contractId` the deployed MergeMint contract, and
    * `networkPassphrase` the passphrase of the target network (see {@link TESTNET}
    * and {@link MAINNET}). Pass `retry` to make every RPC round-trip tolerate
-   * transient failures — see {@link RetryOptions}.
-   * @throws Error if `rpcUrl` still contains a placeholder, or if `retry` holds
-   * an out-of-range `attempts` or `backoffMs`.
+   * transient failures — see {@link RetryOptions}. Pass `skipVersionCheck: true`
+   * to skip contract version compatibility checks (advanced users only).
+   * @throws Error if `rpcUrl` still contains a placeholder, if `retry` holds
+   * an out-of-range `attempts` or `backoffMs`, or if the contract version is
+   * incompatible and `skipVersionCheck` is not true.
    */
-  constructor(config: NetworkConfig) {
+  constructor(config: NetworkConfig & { skipVersionCheck?: boolean } = {} as NetworkConfig) {
     if (!config.contractId || typeof config.contractId !== "string" || config.contractId.trim() === "") {
       throw new MergeMintSdkError("Invalid contractId: contractId must be a non-empty string.", "INVALID_CONTRACT_ID");
     }
@@ -237,6 +247,47 @@ export class MergeMintSDK {
     this.networkPassphrase = config.networkPassphrase;
     this.contractId = config.contractId.trim();
     this.retry = normalizeRetry(config.retry);
+    this.skipVersionCheck = (config as any).skipVersionCheck ?? false;
+  }
+
+  /**
+   * Checks if the contract version is compatible with this SDK.
+   * Called lazily on the first read operation unless `skipVersionCheck` is true.
+   *
+   * @throws MergeMintSdkError if the contract version is incompatible.
+   */
+  private async ensureCompatibleVersion(): Promise<void> {
+    if (this.versionCheckPerformed || this.skipVersionCheck) return;
+
+    this.versionCheckPerformed = true;
+
+    try {
+      const result = await this.simulateReadCall("version", []);
+      if (!result) {
+        throw new MergeMintSdkError(
+          "Contract version check failed: no version returned.",
+          "INCOMPATIBLE_CONTRACT"
+        );
+      }
+
+      const version = String(scValToNative(result));
+      if (!this.isVersionInRange(version)) {
+        throw new MergeMintSdkError(
+          `Incompatible contract version: "${version}". This SDK supports versions ${SUPPORTED_CONTRACT_VERSION_MIN} to ${SUPPORTED_CONTRACT_VERSION_MAX}. Upgrade the SDK or pass skipVersionCheck: true to override this check.`,
+          "INCOMPATIBLE_CONTRACT"
+        );
+      }
+    } catch (error) {
+      if (error instanceof MergeMintSdkError) throw error;
+      throw new MergeMintSdkError(
+        `Failed to check contract version: ${error instanceof Error ? error.message : String(error)}`,
+        "VERSION_CHECK_FAILED"
+      );
+    }
+  }
+
+  private isVersionInRange(version: string): boolean {
+    return version >= SUPPORTED_CONTRACT_VERSION_MIN && version <= SUPPORTED_CONTRACT_VERSION_MAX;
   }
 
   // === Read methods (no transaction needed)
@@ -247,10 +298,12 @@ export class MergeMintSDK {
    * @param bountyId - Bounty id as a hex-encoded `BytesN<32>` string.
    * @returns The decoded {@link Bounty}, or `null` when the contract account is
    * unreachable, the simulation errors, or no bounty exists for that id.
-   * @throws Error if `bountyId` is not valid hex, or if the RPC transport fails
-   * on every attempt allowed by the configured retry policy.
+   * @throws Error if `bountyId` is not valid hex, if the RPC transport fails
+   * on every attempt allowed by the configured retry policy, or if the contract
+   * version is incompatible with this SDK.
    */
   async getBounty(bountyId: string): Promise<Bounty | null> {
+    await this.ensureCompatibleVersion();
     const result = await this.simulateReadCall("get_bounty", [
       hexToBytesN(bountyId),
     ]);
